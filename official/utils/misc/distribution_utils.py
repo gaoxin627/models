@@ -198,6 +198,7 @@ def _undo_monkey_patch_dataset_method(strategy):
 
 
 def set_up_synthetic_data():
+  _monkey_patch_dataset_method(tf.distribute.OneDeviceStrategy)
   _monkey_patch_dataset_method(tf.distribute.MirroredStrategy)
   # TODO(tobyboyd): Remove when contrib.distribute is all in core.
   if hasattr(tf, 'contrib'):
@@ -208,6 +209,7 @@ def set_up_synthetic_data():
 
 
 def undo_set_up_synthetic_data():
+  _undo_monkey_patch_dataset_method(tf.distribute.OneDeviceStrategy)
   _undo_monkey_patch_dataset_method(tf.distribute.MirroredStrategy)
   # TODO(tobyboyd): Remove when contrib.distribute is all in core.
   if hasattr(tf, 'contrib'):
@@ -246,3 +248,21 @@ def configure_cluster(worker_hosts=None, task_index=-1):
   else:
     num_workers = 1
   return num_workers
+
+
+def get_strategy_scope(strategy):
+  if strategy:
+    strategy_scope = strategy.scope()
+  else:
+    strategy_scope = DummyContextManager()
+
+  return strategy_scope
+
+
+class DummyContextManager(object):
+
+  def __enter__(self):
+    pass
+
+  def __exit__(self, *args):
+    pass

@@ -25,6 +25,7 @@ import tensorflow as tf  # pylint: disable=g-bad-import-order
 from official.resnet import imagenet_main
 from official.resnet.keras import keras_common
 from official.resnet.keras import resnet_model
+from official.resnet.keras import trivial_model
 from official.utils.flags import core as flags_core
 from official.utils.logs import logger
 from official.utils.misc import distribution_utils
@@ -118,6 +119,13 @@ def run(flags_obj):
                    if tf.test.is_built_with_cuda() else 'channels_last')
   tf.keras.backend.set_image_data_format(data_format)
 
+  strategy = distribution_utils.get_distribution_strategy(
+      distribution_strategy=flags_obj.distribution_strategy,
+      num_gpus=flags_obj.num_gpus,
+      num_workers=distribution_utils.configure_cluster())
+
+  strategy_scope = distribution_utils.get_strategy_scope(strategy)
+
   # pylint: disable=protected-access
   if flags_obj.use_synthetic_data:
     distribution_utils.set_up_synthetic_data()
@@ -126,10 +134,15 @@ def run(flags_obj):
         width=imagenet_main.DEFAULT_IMAGE_SIZE,
         num_channels=imagenet_main.NUM_CHANNELS,
         num_classes=imagenet_main.NUM_CLASSES,
-        dtype=dtype)
+        dtype=dtype,
+        drop_remainder=True)
   else:
     distribution_utils.undo_set_up_synthetic_data()
     input_fn = imagenet_main.input_fn
+
+  # When `enable_xla` is True, we always drop the remainder of the batches
+  # in the dataset, as XLA-GPU doesn't support dynamic shapes.
+  drop_remainder = flags_obj.enable_xla
 
   train_input_dataset = input_fn(
       is_training=True,
@@ -138,7 +151,8 @@ def run(flags_obj):
       num_epochs=flags_obj.train_epochs,
       parse_record_fn=parse_record_keras,
       datasets_num_private_threads=flags_obj.datasets_num_private_threads,
-      dtype=dtype)
+      dtype=dtype,
+      drop_remainder=drop_remainder)
 
   eval_input_dataset = None
   if not flags_obj.skip_eval:
@@ -148,14 +162,8 @@ def run(flags_obj):
         batch_size=flags_obj.batch_size,
         num_epochs=flags_obj.train_epochs,
         parse_record_fn=parse_record_keras,
-        dtype=dtype)
-
-  strategy = distribution_utils.get_distribution_strategy(
-      distribution_strategy=flags_obj.distribution_strategy,
-      num_gpus=flags_obj.num_gpus,
-      num_workers=distribution_utils.configure_cluster())
-
-  strategy_scope = keras_common.get_strategy_scope(strategy)
+        dtype=dtype,
+        drop_remainder=drop_remainder)
 
   with strategy_scope:
     optimizer = keras_common.get_optimizer()
@@ -164,14 +172,32 @@ def run(flags_obj):
       # can be enabled with a single line of code.
       optimizer = tf.keras.mixed_precision.experimental.LossScaleOptimizer(
           optimizer, loss_scale=flags_core.get_loss_scale(flags_obj))
-    model = resnet_model.resnet50(num_classes=imagenet_main.NUM_CLASSES,
-                                  dtype=dtype)
+
+    if flags_obj.enable_xla and not flags_obj.enable_eager:
+      # TODO(b/129861005): Fix OOM issue in eager mode when setting
+      # `batch_size` in keras.Input layer.
+      if strategy and strategy.num_replicas_in_sync > 1:
+        # TODO(b/129791381): Specify `input_layer_batch_size` value in
+        # DistributionStrategy multi-replica case.
+        input_layer_batch_size = None
+      else:
+        input_layer_batch_size = flags_obj.batch_size
+    else:
+      input_layer_batch_size = None
+
+    if flags_obj.use_trivial_model:
+      model = trivial_model.trivial_model(imagenet_main.NUM_CLASSES)
+    else:
+      model = resnet_model.resnet50(
+          num_classes=imagenet_main.NUM_CLASSES,
+          dtype=dtype,
+          batch_size=input_layer_batch_size)
 
     model.compile(loss='sparse_categorical_crossentropy',
                   optimizer=optimizer,
                   metrics=['sparse_categorical_accuracy'])
 
-  time_callback, tensorboard_callback, lr_callback = keras_common.get_callbacks(
+  callbacks = keras_common.get_callbacks(
       learning_rate_schedule, imagenet_main.NUM_IMAGES['train'])
 
   train_steps = imagenet_main.NUM_IMAGES['train'] // flags_obj.batch_size
@@ -193,10 +219,6 @@ def run(flags_obj):
     num_eval_steps = None
     validation_data = None
 
-  callbacks = [time_callback, lr_callback]
-  if flags_obj.enable_tensorboard:
-    callbacks.append(tensorboard_callback)
-
   history = model.fit(train_input_dataset,
                       epochs=train_epochs,
                       steps_per_epoch=train_steps,
@@ -211,7 +233,7 @@ def run(flags_obj):
     eval_output = model.evaluate(eval_input_dataset,
                                  steps=num_eval_steps,
                                  verbose=2)
-  stats = keras_common.build_stats(history, eval_output, time_callback)
+  stats = keras_common.build_stats(history, eval_output, callbacks)
   return stats
 
 
@@ -223,6 +245,6 @@ def main(_):
 
 if __name__ == '__main__':
   tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
-  imagenet_main.define_imagenet_flags()
+  imagenet_main.define_imagenet_flags(dynamic_loss_scale=True)
   keras_common.define_keras_flags()
   absl_app.run(main)
